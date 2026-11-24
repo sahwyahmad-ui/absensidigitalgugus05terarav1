@@ -56,7 +56,7 @@
       padding-right: 2.5rem !important;
     }
 
-    /* Animasi hanya untuk elemen masuk pertama kali (bukan re-render data) */
+    /* Animasi hanya untuk elemen masuk pertama kali (anti-kedip) */
     @keyframes fadeUpOnce {
       from { opacity: 0; transform: translateY(8px); }
       to { opacity: 1; transform: translateY(0); }
@@ -82,7 +82,6 @@
       transform: translateY(4px) !important;
     }
 
-    /* Varian Warna Tombol 3D */
     .btn-3d-emerald {
       background: linear-gradient(180deg, #10b981 0%, #059669 100%);
       color: #ffffff;
@@ -197,6 +196,29 @@
     </div>
   </div>
 
+  <!-- Modal Konfirmasi Keluar Saat Masih Ada Antrean Offline -->
+  <div id="logout-confirm-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+    <div class="bg-white rounded-3xl max-w-sm w-full p-6 shadow-2xl border border-slate-100 animate-once text-center space-y-4">
+      <div class="w-12 h-12 mx-auto rounded-2xl bg-amber-100 text-amber-600 flex items-center justify-center text-xl">
+        <i class="fa-solid fa-cloud-arrow-up"></i>
+      </div>
+      <div>
+        <h3 class="text-base font-black text-slate-800">Antrean Belum Terkirim</h3>
+        <p class="text-xs text-slate-600 mt-1.5 leading-relaxed">
+          Masih ada data absensi di HP yang sedang menunggu sinyal internet untuk dikirim ke server. Jika keluar akun sekarang, antrean pengiriman akan dibatalkan.
+        </p>
+      </div>
+      <div class="grid grid-cols-2 gap-2.5 pt-1">
+        <button type="button" onclick="window.closeLogoutConfirmModal()" class="py-2.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl text-xs transition">
+          Batal
+        </button>
+        <button type="button" onclick="window.forceGuruLogout()" class="py-2.5 px-3 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs transition">
+          Tetap Keluar
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- Kontainer Utama -->
   <main id="app-root" class="flex-1 w-full max-w-md mx-auto p-4 flex flex-col justify-center"></main>
 
@@ -234,23 +256,22 @@
       employees: [],
       currentUser: null,
       myRecords: [],
-      offlineQueue: [] // Antrean data absensi yang belum terkirim ke Google Sheets
+      offlineQueue: []
     };
 
-    let currentViewMode = null; // 'login' atau 'dashboard' (mencegah render ulang penuh yang bikin berkedip)
+    let currentViewMode = null;
     let isLoading = false;
     let isCheckingGps = false;
     let isSyncingQueue = false;
     let lastExitAllowedState = null;
     let deferredInstallPrompt = null;
-    let cachedGpsPosition = null; // Menyimpan posisi GPS sementara agar tidak menunggu lama saat klik
+    let cachedGpsPosition = null;
+    let gpsWatchId = null;
+    let gpsLiveState = { status: "idle", distance: null, accuracy: null, errorText: "" };
 
-    // Umpan Balik Getaran Halus (Haptic Feedback) saat Tombol 3D Ditekan
     function triggerHapticFeedback() {
       try {
-        if (navigator.vibrate) {
-          navigator.vibrate(25);
-        }
+        if (navigator.vibrate) navigator.vibrate(25);
       } catch (e) {}
     }
 
@@ -314,18 +335,9 @@
       window.addEventListener("beforeinstallprompt", (e) => {
         e.preventDefault();
         deferredInstallPrompt = e;
-        updateInstallButtonVisibility();
+        const btnInstall = document.getElementById("btn-install-app");
+        if (btnInstall) btnInstall.classList.remove("hidden");
       });
-    }
-
-    function updateInstallButtonVisibility() {
-      const container = document.getElementById("install-btn-container");
-      if (!container) return;
-      if (!isStandaloneMode() && !isIosNonSafariBrowser()) {
-        container.classList.remove("hidden");
-      } else {
-        container.classList.add("hidden");
-      }
     }
 
     window.installAppToDevice = async function() {
@@ -345,14 +357,12 @@
           showToast("Aplikasi berhasil dipasang di layar utama HP!", "success");
         }
         deferredInstallPrompt = null;
-        updateInstallButtonVisibility();
       } else {
         showToast("Ketuk menu browser (⋮) lalu pilih 'Tambahkan ke Layar Utama / Install App'.", "info");
       }
     };
 
     window.closeIosInstallModal = function() {
-      triggerHapticFeedback();
       const modal = document.getElementById("ios-install-modal");
       if (modal) {
         modal.classList.add("hidden");
@@ -362,7 +372,8 @@
 
     function loadSavedState() {
       try {
-        const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
+        let raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) raw = localStorage.getItem(LEGACY_STORAGE_KEY);
         if (raw) {
           const parsed = JSON.parse(raw);
           appState = {
@@ -509,21 +520,83 @@
       return Math.round(R * c);
     }
 
-    // Pemanasan GPS di latar belakang agar saat tombol ditekan koordinat langsung siap
-    function prewarmGpsIfNeeded() {
-      if (!appState.schoolConfig || !appState.schoolConfig.useGpsLocation) return;
-      if (!navigator.geolocation) return;
+    // Pemantauan GPS berkelanjutan (watchPosition) agar koordinat & jarak langsung terkunci instan
+    window.startContinuousGpsTracking = function() {
+      const cfg = appState.schoolConfig || {};
+      if (!cfg.useGpsLocation) {
+        stopContinuousGpsTracking();
+        gpsLiveState = { status: "off", distance: null, accuracy: null, errorText: "" };
+        updateGpsBannersDom();
+        return;
+      }
+
+      if (!navigator.geolocation) {
+        gpsLiveState = { status: "error", distance: null, accuracy: null, errorText: "Perangkat tidak mendukung GPS" };
+        updateGpsBannersDom();
+        return;
+      }
+
+      if (gpsWatchId !== null) return;
+
+      gpsLiveState = { status: "searching", distance: null, accuracy: null, errorText: "" };
+      updateGpsBannersDom();
+
+      const updateFromPosition = (pos) => {
+        const userLat = pos.coords.latitude;
+        const userLng = pos.coords.longitude;
+        const accuracy = Math.round(pos.coords.accuracy || 0);
+        cachedGpsPosition = {
+          lat: userLat,
+          lng: userLng,
+          accuracy: accuracy,
+          timestamp: Date.now()
+        };
+
+        const targetLat = parseFloat(String(appState.schoolConfig.schoolLat || "").replace(",", "."));
+        const targetLng = parseFloat(String(appState.schoolConfig.schoolLng || "").replace(",", "."));
+        const dist = (!isNaN(targetLat) && !isNaN(targetLng))
+          ? calculateDistanceMeters(userLat, userLng, targetLat, targetLng)
+          : null;
+
+        gpsLiveState = {
+          status: "locked",
+          distance: dist,
+          accuracy: accuracy,
+          errorText: ""
+        };
+        updateGpsBannersDom();
+      };
+
       navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          cachedGpsPosition = {
-            lat: pos.coords.latitude,
-            lng: pos.coords.longitude,
-            timestamp: Date.now()
-          };
-        },
+        updateFromPosition,
         () => {},
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 15000 }
+        { enableHighAccuracy: true, timeout: 6000, maximumAge: 30000 }
       );
+
+      gpsWatchId = navigator.geolocation.watchPosition(
+        updateFromPosition,
+        () => {
+          if (!cachedGpsPosition) {
+            gpsLiveState = {
+              status: "error",
+              distance: null,
+              accuracy: null,
+              errorText: isIosDevice()
+                ? "Izin Lokasi Safari belum aktif"
+                : "Pastikan GPS/Lokasi HP aktif"
+            };
+            updateGpsBannersDom();
+          }
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 10000 }
+      );
+    };
+
+    function stopContinuousGpsTracking() {
+      if (gpsWatchId !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(gpsWatchId);
+        gpsWatchId = null;
+      }
     }
 
     function verifySchoolLocationIfRequired() {
@@ -545,8 +618,7 @@
           return;
         }
 
-        // Gunakan cache GPS jika usianya kurang dari 20 detik agar super cepat
-        if (cachedGpsPosition && (Date.now() - cachedGpsPosition.timestamp) < 20000) {
+        if (cachedGpsPosition && (Date.now() - cachedGpsPosition.timestamp) < 45000) {
           const distance = calculateDistanceMeters(cachedGpsPosition.lat, cachedGpsPosition.lng, targetLat, targetLng);
           if (distance <= maxRadius) {
             const coordsStr = `${cachedGpsPosition.lat.toFixed(6)},${cachedGpsPosition.lng.toFixed(6)} (${distance}m)`;
@@ -567,8 +639,21 @@
           (pos) => {
             const userLat = pos.coords.latitude;
             const userLng = pos.coords.longitude;
-            cachedGpsPosition = { lat: userLat, lng: userLng, timestamp: Date.now() };
+            cachedGpsPosition = {
+              lat: userLat,
+              lng: userLng,
+              accuracy: Math.round(pos.coords.accuracy || 0),
+              timestamp: Date.now()
+            };
             const distance = calculateDistanceMeters(userLat, userLng, targetLat, targetLng);
+            gpsLiveState = {
+              status: "locked",
+              distance: distance,
+              accuracy: cachedGpsPosition.accuracy,
+              errorText: ""
+            };
+            updateGpsBannersDom();
+
             const coordsStr = `${userLat.toFixed(6)},${userLng.toFixed(6)} (${distance}m)`;
             if (distance <= maxRadius) {
               resolve({ ok: true, coordsText: coordsStr, distance });
@@ -579,7 +664,7 @@
               });
             }
           },
-          (err) => {
+          () => {
             const iosHint = isIosDevice()
               ? " Buka Pengaturan iPhone > Privasi & Keamanan > Layanan Lokasi > pastikan Safari diizinkan."
               : " Pastikan GPS/Lokasi HP aktif dan izin lokasi diizinkan.";
@@ -588,7 +673,7 @@
               message: "Gagal membaca GPS HP!" + iosHint
             });
           },
-          { enableHighAccuracy: true, timeout: 12000, maximumAge: 10000 }
+          { enableHighAccuracy: true, timeout: 8000, maximumAge: 15000 }
         );
       });
     }
@@ -614,7 +699,7 @@
     async function fetchSchoolDataAndEmployees(schoolName, silent = true) {
       if (!schoolName) return;
       isLoading = true;
-      updateLoginSyncBadge();
+      updateStatusIndicator();
       try {
         const res = await fetchWithTimeout(`${SERVER_URL}?action=get_school_data&school=${encodeURIComponent(schoolName)}&_t=${Date.now()}`, {}, 18000);
         const json = await res.json();
@@ -642,15 +727,18 @@
             }
           }
           saveState();
-          prewarmGpsIfNeeded();
+          window.startContinuousGpsTracking();
           updateGpsBannersDom();
+          if (currentViewMode === "dashboard") {
+            updateDashboardDom();
+          }
           if (!silent) showToast(`Data ${schoolName} diperbarui (${appState.employees.length} pegawai).`, "success");
         }
       } catch (e) {
         if (!silent) showToast("Koneksi lambat. Menggunakan data tersimpan di HP.", "info");
       }
       isLoading = false;
-      updateLoginSyncBadge();
+      updateStatusIndicator();
     }
 
     async function fetchMyAttendanceRecords(silent = true) {
@@ -665,37 +753,45 @@
             (meId && String(r.employee_id || "").trim() === meId) ||
             String(r.name || "").trim().toLowerCase() === meName
           );
-          const serverRecords = filtered.slice(-MAX_CACHED_RECORDS).reverse().map(r => ({
-            ...r,
-            sync_status: "synced"
-          }));
+          const serverRecords = filtered.slice(-MAX_CACHED_RECORDS).reverse();
 
-          // Pertahankan data dari antrean offline agar tidak tertimpa oleh data server yang belum ter-update
-          const queuedDates = new Set(appState.offlineQueue.map(q => q.tanggal));
-          const localQueuedRecords = appState.myRecords.filter(r => queuedDates.has(r.date));
-          const merged = [...localQueuedRecords];
-          for (const sr of serverRecords) {
-            if (!queuedDates.has(sr.date)) {
-              merged.push(sr);
+          const merged = [...serverRecords];
+          appState.offlineQueue.forEach(qItem => {
+            const existingIdx = merged.findIndex(r => r.date === qItem.payload.tanggal);
+            const pendingRec = {
+              date: qItem.payload.tanggal,
+              status: qItem.payload.status,
+              check_in: qItem.payload.jam_masuk,
+              check_out: qItem.payload.jam_pulang,
+              pendingSync: true
+            };
+            if (existingIdx >= 0) {
+              merged[existingIdx] = {
+                ...merged[existingIdx],
+                status: pendingRec.status,
+                check_in: pendingRec.check_in !== "-" ? pendingRec.check_in : merged[existingIdx].check_in,
+                check_out: pendingRec.check_out !== "-" ? pendingRec.check_out : merged[existingIdx].check_out,
+                pendingSync: true
+              };
+            } else {
+              merged.unshift(pendingRec);
             }
-          }
+          });
 
           appState.myRecords = merged.slice(0, MAX_CACHED_RECORDS);
           saveState();
-          updateDashboardDom();
-          if (!silent) showToast("Riwayat presensi berhasil disegarkan.", "success");
+          if (currentViewMode === "dashboard") {
+            updateDashboardDom();
+          }
+          if (!silent) showToast("Riwayat presensi berhasil dimuat ulang.", "success");
         }
       } catch (e) {
-        if (!silent) showToast("Sedang mode offline. Menampilkan data tersimpan di HP.", "info");
+        if (!silent) showToast("Menggunakan riwayat tersimpan di HP (sinyal lemah).", "info");
       }
     }
 
-    // Proses Pengiriman Antrean Offline ke Google Sheets di Latar Belakang
-    async function processOfflineQueue(isManualTrigger = false) {
-      if (isSyncingQueue || appState.offlineQueue.length === 0) {
-        updateQueueStatusBanner();
-        return;
-      }
+    async function processOfflineQueue(notifyOnSuccess = true) {
+      if (isSyncingQueue || appState.offlineQueue.length === 0) return;
       if (typeof navigator !== "undefined" && navigator.onLine === false) {
         updateQueueStatusBanner();
         return;
@@ -705,48 +801,58 @@
       updateQueueStatusBanner();
 
       let syncedCount = 0;
-      while (appState.offlineQueue.length > 0) {
-        const item = appState.offlineQueue[0];
+      const remainingQueue = [];
+
+      for (let i = 0; i < appState.offlineQueue.length; i++) {
+        const item = appState.offlineQueue[i];
         try {
           const res = await fetchWithTimeout(SERVER_URL, {
             method: "POST",
             headers: { "Content-Type": "text/plain;charset=utf-8" },
             body: JSON.stringify(item.payload)
-          }, 25000);
+          }, 22000);
           const json = await res.json();
 
           if (json && (json.result === "success" || json.result === "locked")) {
-            // Hapus dari antrean karena sudah masuk ke server
-            appState.offlineQueue.shift();
             syncedCount++;
-
-            // Tandai record di riwayat HP sebagai tersinkronisasi penuh
-            const recIdx = appState.myRecords.findIndex(r => r.date === item.tanggal);
+            const recIdx = appState.myRecords.findIndex(r => r.date === item.payload.tanggal);
             if (recIdx >= 0) {
-              appState.myRecords[recIdx].sync_status = "synced";
+              appState.myRecords[recIdx].pendingSync = false;
             }
-            saveState();
-            updateDashboardDom();
           } else {
-            break; // Server memberi respons tak terduga, coba lagi nanti
+            remainingQueue.push(item);
           }
-        } catch (err) {
-          // Koneksi masih terputus/lambat, berhenti sementara & coba lagi otomatis nanti
-          break;
+        } catch (e) {
+          remainingQueue.push(item);
         }
       }
 
+      appState.offlineQueue = remainingQueue;
+      saveState();
       isSyncingQueue = false;
       updateQueueStatusBanner();
-      updateDashboardDom();
 
-      if (syncedCount > 0 && isManualTrigger) {
-        showToast("Data Berhasil Tersimpan ke Server Pusat!", "success");
+      if (currentViewMode === "dashboard") {
+        updateDashboardDom();
+      }
+
+      if (syncedCount > 0 && notifyOnSuccess) {
+        showToast("Antrean absensi berhasil terkirim ke server Google Sheets!", "success");
+      }
+    }
+
+    function updateStatusIndicator() {
+      const badge = document.getElementById("sync-status-badge");
+      if (!badge) return;
+      if (isLoading) {
+        badge.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1 text-blue-600"></i> Memuat data sekolah...`;
+      } else {
+        badge.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-600 mr-1"></i> Terhubung ke Server (${appState.employees.length} Pegawai)`;
       }
     }
 
     // =========================================================================
-    // AKSI PENGGUNA (PILIH SEKOLAH, LOGIN, ABSEN MASUK/PULANG/IZIN)
+    // AKSI PENGGUNA (PILIH SEKOLAH, LOGIN, ABSEN INSTAN + ANTREAN OFFLINE)
     // =========================================================================
     window.onSelectSchoolChange = async function(schoolName) {
       appState.selectedSchool = schoolName;
@@ -756,7 +862,6 @@
     };
 
     window.togglePasswordView = function() {
-      triggerHapticFeedback();
       const inp = document.getElementById("pw-field");
       const ico = document.getElementById("pw-eye");
       if (!inp) return;
@@ -824,7 +929,7 @@
       saveState();
       showToast(`Selamat datang, ${matched.name}!`, "success");
       ensureViewRendered(true);
-      prewarmGpsIfNeeded();
+      window.startContinuousGpsTracking();
       fetchMyAttendanceRecords(true);
       processOfflineQueue(false);
     };
@@ -832,11 +937,27 @@
     window.handleGuruLogout = function() {
       triggerHapticFeedback();
       if (appState.offlineQueue.length > 0) {
-        const confirmOut = window.confirm(
-          "Masih ada data absensi di HP yang sedang menunggu sinyal untuk dikirim ke server. Jika keluar akun sekarang, antrean pengiriman akan dibatalkan. Tetap keluar?"
-        );
-        if (!confirmOut) return;
+        const modal = document.getElementById("logout-confirm-modal");
+        if (modal) {
+          modal.classList.remove("hidden");
+          modal.classList.add("flex");
+        }
+        return;
       }
+      window.forceGuruLogout();
+    };
+
+    window.closeLogoutConfirmModal = function() {
+      const modal = document.getElementById("logout-confirm-modal");
+      if (modal) {
+        modal.classList.add("hidden");
+        modal.classList.remove("flex");
+      }
+    };
+
+    window.forceGuruLogout = function() {
+      window.closeLogoutConfirmModal();
+      stopContinuousGpsTracking();
       appState.currentUser = null;
       appState.myRecords = [];
       appState.offlineQueue = [];
@@ -855,11 +976,11 @@
 
       if (actionType === "in") {
         if (lock.isLeaveStatus) {
-          showToast(`Anda sudah tercatat "${existingToday.status}" hari ini. Presensi terkunci.`, "error");
+          showToast(`Anda sudah tercatat "${existingToday.status}" hari ini. Presensi tidak dapat diubah.`, "error");
           return;
         }
         if (lock.hasCheckedIn) {
-          showToast(`Data Berhasil Tersimpan (Masuk pukul ${existingToday.check_in} WITA).`, "info");
+          showToast(`Data Berhasil Tersimpan (Absen Masuk pukul ${existingToday.check_in} WITA).`, "info");
           return;
         }
       } else if (actionType === "out") {
@@ -868,11 +989,11 @@
           return;
         }
         if (!lock.hasCheckedIn) {
-          showToast("Silakan lakukan Absen Masuk terlebih dahulu sebelum Absen Pulang!", "error");
+          showToast("Anda harus melakukan Absen Masuk terlebih dahulu sebelum Absen Pulang!", "error");
           return;
         }
         if (lock.hasCheckedOut) {
-          showToast(`Data Berhasil Tersimpan (Pulang pukul ${existingToday.check_out} WITA).`, "info");
+          showToast(`Data Berhasil Tersimpan (Absen Pulang pukul ${existingToday.check_out} WITA).`, "info");
           return;
         }
         const check = canCheckOutNow();
@@ -885,6 +1006,21 @@
           showToast(`Presensi hari ini sudah tercatat (${existingToday.status}) dan terkunci.`, "error");
           return;
         }
+      }
+
+      let verifiedLocation = "";
+      if ((actionType === "in" || actionType === "out") && appState.schoolConfig.useGpsLocation) {
+        isCheckingGps = true;
+        updateGpsCheckingBanner(true);
+        const gpsCheck = await verifySchoolLocationIfRequired();
+        isCheckingGps = false;
+        updateGpsCheckingBanner(false);
+
+        if (!gpsCheck.ok) {
+          showToast(gpsCheck.message, "error");
+          return;
+        }
+        verifiedLocation = gpsCheck.coordsText || "";
       }
 
       let finalStatus = "Hadir";
@@ -904,22 +1040,6 @@
         jamPulang = "-";
       }
 
-      // Verifikasi GPS jika sekolah mengaktifkannya
-      let verifiedLocation = "";
-      if ((actionType === "in" || actionType === "out") && appState.schoolConfig.useGpsLocation) {
-        isCheckingGps = true;
-        updateGpsCheckingBanner(true);
-        const gpsCheck = await verifySchoolLocationIfRequired();
-        isCheckingGps = false;
-        updateGpsCheckingBanner(false);
-
-        if (!gpsCheck.ok) {
-          showToast(gpsCheck.message, "error");
-          return;
-        }
-        verifiedLocation = gpsCheck.coordsText || "";
-      }
-
       const payload = {
         action: "record_attendance",
         kecamatan: appState.schoolConfig.district || "KECAMATAN TERARA",
@@ -937,70 +1057,179 @@
         lock_daily: true
       };
 
-      // 1. SIMPAN INSTAN KE MEMORI HP & ANTREAN OFFLINE (RESPON 0 DETIK)
       const newRec = {
         date: todayStr,
         status: finalStatus,
         check_in: jamMasuk,
         check_out: jamPulang,
-        sync_status: "queued"
+        pendingSync: true
       };
       const idx = appState.myRecords.findIndex(r => r.date === todayStr);
       if (idx >= 0) appState.myRecords[idx] = newRec;
       else appState.myRecords.unshift(newRec);
 
-      // Ganti antrean pada tanggal & aksi yang sama jika ada, lalu tambahkan ke antrean
-      appState.offlineQueue = appState.offlineQueue.filter(q => !(q.tanggal === todayStr && q.actionType === actionType));
       appState.offlineQueue.push({
         id: `${todayStr}_${actionType}_${Date.now()}`,
-        tanggal: todayStr,
-        actionType: actionType,
-        payload: payload,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        payload: payload
       });
 
       saveState();
-
-      // 2. LANGSUNG PERBARUI TAMPILAN TOMBOL & STATUS TANPA BERKEDIP
       updateDashboardDom();
 
-      const detailWaktu = actionType === "in"
-        ? `Masuk pukul ${jamMasuk} WITA (${finalStatus})`
+      const successText = actionType === "in"
+        ? `Data Berhasil Tersimpan • Masuk ${jamMasuk} WITA (${finalStatus})`
         : actionType === "out"
-        ? `Pulang pukul ${jamPulang} WITA`
-        : `Keterangan: ${finalStatus}`;
+        ? `Data Berhasil Tersimpan • Pulang ${jamPulang} WITA`
+        : `Data Berhasil Tersimpan • Keterangan "${finalStatus}"`;
+      showToast(successText, "success");
 
-      showToast(`Data Berhasil Tersimpan • ${detailWaktu}`, "success");
-
-      // 3. KIRIM KE SERVER GOOGLE SHEETS DI LATAR BELAKANG
       processOfflineQueue(false);
     };
 
     // =========================================================================
-    // RENDER & UPDATE DOM PARSIAL (ANTI-KEDIP / ZERO FLICKER)
+    // RENDER & UPDATE PARSIAL ANTI-KEDIP (DOM PATCHING)
     // =========================================================================
     function ensureViewRendered(forceRebuild = false) {
       const targetMode = appState.currentUser ? "dashboard" : "login";
       if (!forceRebuild && currentViewMode === targetMode) {
         if (targetMode === "dashboard") updateDashboardDom();
-        else updateLoginDom();
         return;
       }
-
       currentViewMode = targetMode;
-      const root = document.getElementById("app-root");
-      if (!root) return;
-
       if (targetMode === "login") {
-        renderLoginSkeleton(root);
-        updateLoginDom();
+        renderLoginSkeleton();
       } else {
-        renderDashboardSkeleton(root);
+        renderDashboardSkeleton();
         updateDashboardDom();
       }
     }
 
-    function renderLoginSkeleton(root) {
+    function updateSchoolDropdownDom() {
+      const sel = document.getElementById("login-school-select");
+      if (!sel) return;
+      if (appState.schoolsList.length > 0) {
+        sel.innerHTML = appState.schoolsList.map(s =>
+          `<option value="${escapeHTML(s)}" ${s === appState.selectedSchool ? "selected" : ""}>${escapeHTML(s)}</option>`
+        ).join("");
+      }
+    }
+
+    function updateGpsCheckingBanner(checking) {
+      const el = document.getElementById("gps-checking-banner");
+      if (!el) return;
+      if (checking) {
+        el.classList.remove("hidden");
+      } else {
+        el.classList.add("hidden");
+      }
+    }
+
+    function updateGpsBannersDom() {
+      const cfg = appState.schoolConfig || {};
+      const useGps = Boolean(cfg.useGpsLocation);
+      const maxRadius = Math.max(10, Number(cfg.schoolRadius) || 100);
+
+      let bannerClass = "bg-slate-50 text-slate-600 border-slate-200";
+      let bannerHtml = `<i class="fa-solid fa-circle-info text-slate-400 mr-1"></i> GPS tidak aktif, dapat melakukan absensi`;
+      let headerClass = "text-[10px] mt-1 leading-snug text-blue-100/90";
+      let headerHtml = `<i class="fa-solid fa-circle-info mr-1"></i> GPS tidak aktif, dapat melakukan absensi`;
+
+      if (useGps) {
+        if (gpsLiveState.status === "locked" && gpsLiveState.distance !== null) {
+          const isInside = gpsLiveState.distance <= maxRadius;
+          if (isInside) {
+            bannerClass = "bg-emerald-50 text-emerald-800 border-emerald-300";
+            bannerHtml = `<i class="fa-solid fa-location-dot text-emerald-600 mr-1"></i> GPS Terkunci • Jarak <strong>${gpsLiveState.distance}m</strong> dari sekolah (Siap Absen)`;
+            headerClass = "text-[10px] mt-1 leading-snug text-emerald-300 font-bold";
+            headerHtml = `<i class="fa-solid fa-location-dot mr-1"></i> Dalam Area Sekolah (${gpsLiveState.distance}m / maks ${maxRadius}m)`;
+          } else {
+            bannerClass = "bg-rose-50 text-rose-800 border-rose-300";
+            bannerHtml = `<i class="fa-solid fa-triangle-exclamation text-rose-600 mr-1"></i> Di Luar Area • Jarak <strong>${gpsLiveState.distance}m</strong> (Batas ${maxRadius}m)`;
+            headerClass = "text-[10px] mt-1 leading-snug text-amber-300 font-bold";
+            headerHtml = `<i class="fa-solid fa-triangle-exclamation mr-1"></i> Di Luar Area Sekolah (${gpsLiveState.distance}m)`;
+          }
+        } else if (gpsLiveState.status === "error") {
+          bannerClass = "bg-amber-50 text-amber-900 border-amber-300";
+          bannerHtml = `<i class="fa-solid fa-location-crosshairs text-amber-600 mr-1"></i> ${escapeHTML(gpsLiveState.errorText)} • <button type="button" onclick="window.startContinuousGpsTracking()" class="underline font-black">Coba Kunci GPS</button>`;
+          headerClass = "text-[10px] mt-1 leading-snug text-amber-300 font-bold";
+          headerHtml = `<i class="fa-solid fa-location-crosshairs mr-1"></i> ${escapeHTML(gpsLiveState.errorText)}`;
+        } else {
+          bannerClass = "bg-blue-50 text-blue-800 border-blue-200";
+          bannerHtml = `<i class="fa-solid fa-satellite-dish fa-beat text-blue-600 mr-1.5"></i> Mengunci sinyal GPS sekolah...`;
+          headerClass = "text-[10px] mt-1 leading-snug text-emerald-300 font-bold";
+          headerHtml = `<i class="fa-solid fa-location-dot mr-1"></i> GPS Aktif (Radius maks ${maxRadius}m)`;
+        }
+      }
+
+      const loginBanner = document.getElementById("login-gps-banner");
+      if (loginBanner) {
+        loginBanner.className = `p-2.5 rounded-xl text-[11px] font-bold border ${bannerClass}`;
+        loginBanner.innerHTML = bannerHtml;
+      }
+
+      const dashHeaderGps = document.getElementById("dash-header-gps");
+      if (dashHeaderGps) {
+        dashHeaderGps.className = headerClass;
+        dashHeaderGps.innerHTML = headerHtml;
+      }
+
+      const dashCardGps = document.getElementById("dash-card-gps");
+      if (dashCardGps) {
+        dashCardGps.className = `p-2.5 rounded-xl text-center text-[11px] font-bold border ${bannerClass}`;
+        dashCardGps.innerHTML = bannerHtml;
+      }
+
+      const entryLimitEl = document.getElementById("dash-entry-limit");
+      if (entryLimitEl) {
+        entryLimitEl.textContent = `${appState.schoolConfig.entryTimeLimit || "07:15:00"} WITA`;
+      }
+    }
+
+    function updateQueueStatusBanner() {
+      const box = document.getElementById("queue-status-banner");
+      if (!box) return;
+      const count = appState.offlineQueue.length;
+      if (count === 0) {
+        box.classList.add("hidden");
+        return;
+      }
+      box.classList.remove("hidden");
+      if (isSyncingQueue) {
+        box.className = "p-3 rounded-2xl bg-blue-50 border border-blue-200 text-blue-800 text-xs font-bold flex items-center justify-between gap-2";
+        box.innerHTML = `
+          <div class="flex items-center gap-2">
+            <i class="fa-solid fa-cloud-arrow-up fa-bounce text-blue-600 text-sm"></i>
+            <span>Data Berhasil Tersimpan • Mengirim ke server...</span>
+          </div>
+          <span class="px-2 py-0.5 bg-blue-600 text-white rounded-full text-[10px]">${count}</span>
+        `;
+      } else {
+        box.className = "p-3 rounded-2xl bg-amber-50 border border-amber-300 text-amber-900 text-xs font-bold flex items-center justify-between gap-2";
+        box.innerHTML = `
+          <div class="flex items-center gap-2">
+            <i class="fa-solid fa-mobile-screen-button text-amber-600 text-sm"></i>
+            <div>
+              <div>Data Berhasil Tersimpan (Mode Offline)</div>
+              <div class="text-[10px] font-medium text-amber-700">Otomatis terkirim saat sinyal internet normal</div>
+            </div>
+          </div>
+          <button type="button" onclick="processOfflineQueue(true)" class="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-[10px] font-extrabold shrink-0">
+            Kirim (${count})
+          </button>
+        `;
+      }
+    }
+
+    function renderLoginSkeleton() {
+      const root = document.getElementById("app-root");
+      if (!root) return;
+
+      const schoolOptions = appState.schoolsList.length > 0
+        ? appState.schoolsList.map(s => `<option value="${escapeHTML(s)}" ${s === appState.selectedSchool ? "selected" : ""}>${escapeHTML(s)}</option>`).join("")
+        : (appState.selectedSchool ? `<option value="${escapeHTML(appState.selectedSchool)}" selected>${escapeHTML(appState.selectedSchool)}</option>` : `<option value="">Memuat daftar sekolah...</option>`);
+
+      const standalone = isStandaloneMode();
       const ios = isIosDevice();
       const iosInApp = isIosNonSafariBrowser();
 
@@ -1015,7 +1244,7 @@
                   <p class="mt-1 text-amber-800">Ketuk <strong>ikon Kompas (Safari)</strong> di <strong>pojok kanan bawah</strong> layar WhatsApp Anda agar terbuka di Safari, lalu pasang ke Layar Utama.</p>
                 </div>
               </div>
-              <button type="button" onclick="window.copyCurrentAppLink()" class="btn-3d w-full py-2 bg-amber-600/15 hover:bg-amber-600/25 text-amber-900 font-bold rounded-xl text-[11px] flex items-center justify-center gap-1.5">
+              <button type="button" onclick="window.copyCurrentAppLink()" class="w-full py-2 bg-amber-600/15 hover:bg-amber-600/25 text-amber-900 font-bold rounded-xl text-[11px] flex items-center justify-center gap-1.5 transition">
                 <i class="fa-solid fa-copy"></i>
                 <span>Atau Salin Link (Jika Ikon Kompas Tidak Muncul)</span>
               </button>
@@ -1024,10 +1253,10 @@
 
           <div class="bg-white/95 backdrop-blur-md rounded-3xl shadow-xl border border-white p-6 sm:p-7">
             <div class="text-center mb-5">
-              <div class="w-20 h-20 mx-auto mb-3 rounded-2xl bg-white p-1.5 shadow-lg border border-slate-100 flex items-center justify-center overflow-hidden">
+              <div class="w-20 h-20 mx-auto mb-3 bg-white rounded-2xl p-1.5 flex items-center justify-center shadow-lg border border-slate-100 overflow-hidden">
                 <img src="ICON_KKG_GUGUS_05_TERARA_512x512.png" alt="Logo KKG Gugus 05 Terara"
-                  class="w-full h-full object-contain rounded-xl"
-                  onerror="this.style.display='none'; this.nextElementSibling.classList.remove('hidden');" />
+                  onerror="this.style.display='none'; this.nextElementSibling.classList.remove('hidden');"
+                  class="w-full h-full object-contain rounded-xl" />
                 <div class="hidden w-full h-full bg-gradient-to-tr from-blue-600 to-indigo-600 rounded-xl flex items-center justify-center text-white text-2xl">
                   <i class="fa-solid fa-school"></i>
                 </div>
@@ -1044,6 +1273,7 @@
                 <label class="block text-[11px] font-extrabold text-slate-600 uppercase mb-1">Unit Sekolah</label>
                 <select id="login-school-select" name="school" onchange="window.onSelectSchoolChange(this.value)" required
                   class="w-full p-3 bg-blue-50/70 border border-blue-200 rounded-xl font-bold text-slate-800 focus:outline-none focus:border-blue-500">
+                  ${schoolOptions}
                 </select>
               </div>
 
@@ -1077,54 +1307,36 @@
               </button>
             </form>
 
-            <div id="install-btn-container" class="mt-4 hidden">
-              <button type="button" onclick="window.installAppToDevice()" class="btn-3d w-full py-2.5 px-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 shadow-[0_4px_0_#334155]">
-                <i class="${ios ? "fa-brands fa-apple text-sm" : "fa-solid fa-mobile-screen-button"}"></i>
-                <span>${ios ? "Pasang di Layar Utama iPhone / iPad" : "Instal Aplikasi ke Layar Utama HP"}</span>
-              </button>
-            </div>
+            ${!standalone && !iosInApp ? `
+              <div id="btn-install-app" class="mt-4">
+                <button type="button" onclick="window.installAppToDevice()" class="w-full py-2.5 px-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition shadow-sm">
+                  <i class="${ios ? "fa-brands fa-apple text-sm" : "fa-solid fa-mobile-screen-button"}"></i>
+                  <span>${ios ? "Pasang di Layar Utama iPhone / iPad" : "Instal Aplikasi ke Layar Utama HP"}</span>
+                </button>
+              </div>
+            ` : ""}
 
             <div class="mt-4 pt-4 border-t border-slate-100 text-center space-y-2.5">
-              <div id="sync-status-badge" class="text-[11px] font-semibold text-slate-500"></div>
-              <div id="login-gps-banner" class="p-2.5 rounded-xl text-[11px] font-bold border"></div>
+              <div id="sync-status-badge" class="text-[11px] font-semibold text-slate-500">
+                <i class="fa-solid fa-circle-check text-emerald-600 mr-1"></i> Terhubung ke Server (${appState.employees.length} Pegawai)
+              </div>
+              <div id="login-gps-banner" class="p-2.5 rounded-xl text-[11px] font-bold border bg-slate-50 text-slate-600 border-slate-200">
+                <i class="fa-solid fa-circle-info text-slate-400 mr-1"></i> Memeriksa pengaturan GPS...
+              </div>
             </div>
           </div>
         </div>
       `;
-    }
-
-    function updateLoginDom() {
-      updateSchoolDropdownDom();
-      updateLoginSyncBadge();
+      updateStatusIndicator();
       updateGpsBannersDom();
-      updateInstallButtonVisibility();
     }
 
-    function updateSchoolDropdownDom() {
-      const sel = document.getElementById("login-school-select");
-      if (!sel) return;
-      const html = appState.schoolsList.length > 0
-        ? appState.schoolsList.map(s => `<option value="${escapeHTML(s)}" ${s === appState.selectedSchool ? "selected" : ""}>${escapeHTML(s)}</option>`).join("")
-        : (appState.selectedSchool
-            ? `<option value="${escapeHTML(appState.selectedSchool)}" selected>${escapeHTML(appState.selectedSchool)}</option>`
-            : `<option value="">Memuat daftar sekolah...</option>`);
-      if (sel.innerHTML !== html) {
-        sel.innerHTML = html;
-      }
-    }
+    function renderDashboardSkeleton() {
+      const root = document.getElementById("app-root");
+      if (!root || !appState.currentUser) return;
 
-    function updateLoginSyncBadge() {
-      const badge = document.getElementById("sync-status-badge");
-      if (!badge) return;
-      if (isLoading) {
-        badge.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1 text-blue-600"></i> Memuat data sekolah...`;
-      } else {
-        badge.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-600 mr-1"></i> Terhubung ke Server (${appState.employees.length} Pegawai)`;
-      }
-    }
-
-    function renderDashboardSkeleton(root) {
       const todayStr = getTodayDateStr();
+
       root.innerHTML = `
         <div class="space-y-4 animate-once my-auto">
           <!-- Header Profil Guru -->
@@ -1137,7 +1349,7 @@
                 <h2 class="text-lg font-black leading-tight">${escapeHTML(appState.currentUser.name)}</h2>
                 <p class="text-xs text-blue-200 mt-0.5">${escapeHTML(appState.currentUser.position)} • NIP: ${escapeHTML(appState.currentUser.employee_number || "-")}</p>
               </div>
-              <button onclick="window.handleGuruLogout()" title="Keluar Akun" class="btn-3d px-3 py-1.5 bg-white/15 hover:bg-white/25 rounded-xl text-[11px] font-bold text-white flex items-center gap-1.5 shrink-0 shadow-[0_3px_0_rgba(0,0,0,0.25)]">
+              <button onclick="window.handleGuruLogout()" title="Keluar Akun" class="px-2.5 py-1.5 bg-white/15 hover:bg-white/25 rounded-xl text-[11px] font-bold text-white flex items-center gap-1.5 shrink-0 transition">
                 <i class="fa-solid fa-power-off"></i>
                 <span>Keluar</span>
               </button>
@@ -1147,67 +1359,86 @@
               <div>
                 <div class="text-[11px] text-blue-200">${escapeHTML(formatDateIndo(todayStr))}</div>
                 <div class="text-[10px] text-blue-200/80">Batas Masuk: <strong id="dash-entry-limit">${escapeHTML(appState.schoolConfig.entryTimeLimit || "07:15:00")} WITA</strong></div>
-                <div id="dash-header-gps" class="text-[10px] mt-1 leading-snug"></div>
+                <div id="dash-header-gps" class="text-[10px] mt-1 leading-snug text-blue-100/90"></div>
               </div>
-              <div id="live-clock" class="text-xl font-black font-mono tracking-tight shrink-0">${getNowTimeStr()}</div>
+              <div id="live-clock" class="text-xl font-black font-mono tracking-tight shrink-0">--:--:--</div>
             </div>
           </div>
 
-          <!-- Banner Status Antrean / Sinkronisasi Otomatis -->
-          <div id="offline-queue-banner" class="hidden"></div>
+          <!-- Banner Antrean Offline -->
+          <div id="queue-status-banner" class="hidden"></div>
 
           <!-- Kartu Status & Tombol Absen 3D -->
           <div class="bg-white/95 backdrop-blur-md rounded-3xl p-5 shadow-md border border-white space-y-4">
-            <div id="dash-card-gps" class="p-2.5 rounded-xl text-center text-[11px] font-bold border"></div>
+            <div id="dash-card-gps" class="p-2.5 rounded-xl text-center text-[11px] font-bold border bg-slate-50 text-slate-600 border-slate-200"></div>
 
             <div id="gps-checking-banner" class="hidden p-2.5 bg-blue-50 border border-blue-200 rounded-xl text-center text-xs font-bold text-blue-700">
-              <i class="fa-solid fa-spinner fa-spin mr-1.5"></i> Memeriksa titik koordinat GPS...
+              <i class="fa-solid fa-location-crosshairs fa-spin mr-1.5"></i> Memverifikasi titik koordinat GPS...
             </div>
 
             <!-- Banner Konfirmasi Data Berhasil Tersimpan -->
-            <div id="saved-confirmation-banner" class="hidden"></div>
+            <div id="saved-confirmation-banner" class="hidden p-3 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2.5">
+                <div class="w-8 h-8 rounded-full bg-emerald-600 text-white flex items-center justify-center shrink-0">
+                  <i class="fa-solid fa-check text-sm"></i>
+                </div>
+                <div>
+                  <div class="text-xs font-black text-emerald-900">Data Berhasil Tersimpan</div>
+                  <div id="saved-confirmation-sub" class="text-[10px] font-semibold text-emerald-700">Tercatat untuk hari ini</div>
+                </div>
+              </div>
+              <span id="saved-sync-pill" class="px-2 py-0.5 rounded-full text-[9px] font-extrabold uppercase bg-emerald-200/70 text-emerald-900">Terkirim</span>
+            </div>
 
             <!-- Ringkasan Jam Masuk, Pulang, Status -->
             <div class="grid grid-cols-3 gap-2 p-3 bg-slate-50 rounded-2xl border border-slate-100 text-center">
               <div>
                 <span class="block text-[10px] font-bold text-slate-400 uppercase">Masuk</span>
-                <span id="stat-check-in" class="font-mono text-xs font-black text-emerald-700">--:--</span>
+                <span id="stat-jam-masuk" class="font-mono text-xs font-black text-emerald-700">--:--</span>
               </div>
               <div>
                 <span class="block text-[10px] font-bold text-slate-400 uppercase">Pulang</span>
-                <span id="stat-check-out" class="font-mono text-xs font-black text-blue-700">--:--</span>
+                <span id="stat-jam-pulang" class="font-mono text-xs font-black text-blue-700">--:--</span>
               </div>
               <div>
                 <span class="block text-[10px] font-bold text-slate-400 uppercase">Status</span>
-                <span id="stat-status" class="text-[11px] font-extrabold uppercase text-slate-400">Belum Absen</span>
+                <span id="stat-status-hari" class="text-[11px] font-extrabold uppercase text-slate-400">Belum Absen</span>
               </div>
             </div>
 
-            <!-- Tombol Utama Masuk & Pulang (3D Pushable) -->
+            <!-- Tombol Utama Masuk & Pulang (Efek 3D) -->
             <div class="grid grid-cols-2 gap-3 pb-1">
               <button id="btn-absen-masuk" onclick="window.submitPresensi('in')"
-                class="btn-3d py-4 px-3 font-black rounded-2xl flex flex-col items-center justify-center text-xs">
+                class="btn-3d btn-3d-emerald py-4 px-3 font-black rounded-2xl flex flex-col items-center justify-center text-xs">
+                <i id="ico-absen-masuk" class="fa-solid fa-right-to-bracket text-xl mb-1"></i>
+                <span id="lbl-absen-masuk">ABSEN MASUK</span>
+                <span id="sub-absen-masuk" class="text-[9px] font-semibold mt-0.5">1x Sehari</span>
               </button>
 
               <button id="btn-absen-pulang" onclick="window.submitPresensi('out')"
-                class="btn-3d py-4 px-3 font-black rounded-2xl flex flex-col items-center justify-center text-xs">
+                class="py-4 px-3 bg-slate-200 text-slate-400 cursor-not-allowed font-black rounded-2xl flex flex-col items-center justify-center text-xs">
+                <i id="ico-absen-pulang" class="fa-solid fa-lock text-xl mb-1"></i>
+                <span id="lbl-absen-pulang">ABSEN PULANG</span>
+                <span id="sub-absen-pulang" class="text-[9px] font-semibold mt-0.5">Absen Masuk Dulu</span>
               </button>
             </div>
 
-            <!-- Keterangan Tidak Hadir (3D Pushable) -->
-            <div class="pt-3 border-t border-slate-100 text-center pb-1">
-              <p id="leave-section-title" class="text-[10px] font-bold text-slate-400 uppercase mb-2.5"></p>
-              <div class="grid grid-cols-3 gap-2">
+            <!-- Keterangan Tidak Hadir (Efek 3D) -->
+            <div class="pt-3 border-t border-slate-100 text-center">
+              <p id="lbl-leave-header" class="text-[10px] font-bold text-slate-400 uppercase mb-2.5">
+                Keterangan Tidak Hadir Hari Ini (1x Pilih)
+              </p>
+              <div class="grid grid-cols-3 gap-2 pb-1">
                 <button id="btn-leave-dl" onclick="window.submitPresensi('status', 'Dinas Luar')"
-                  class="btn-3d py-2.5 rounded-xl text-xs font-bold">
+                  class="btn-3d btn-3d-cyan py-2.5 rounded-xl text-xs font-bold">
                   Dinas Luar
                 </button>
                 <button id="btn-leave-izin" onclick="window.submitPresensi('status', 'Izin')"
-                  class="btn-3d py-2.5 rounded-xl text-xs font-bold">
+                  class="btn-3d btn-3d-amber py-2.5 rounded-xl text-xs font-bold">
                   Izin
                 </button>
                 <button id="btn-leave-sakit" onclick="window.submitPresensi('status', 'Sakit')"
-                  class="btn-3d py-2.5 rounded-xl text-xs font-bold">
+                  class="btn-3d btn-3d-purple py-2.5 rounded-xl text-xs font-bold">
                   Sakit
                 </button>
               </div>
@@ -1218,293 +1449,183 @@
           <div class="bg-white/95 backdrop-blur-md rounded-3xl p-4 shadow-md border border-white">
             <div class="flex items-center justify-between mb-3 px-1">
               <h3 class="text-xs font-black text-slate-800 uppercase">Riwayat Presensi Terakhir</h3>
-              <button onclick="window.manualRefreshRecords()" class="text-[11px] font-bold text-blue-600 hover:underline flex items-center gap-1">
-                <i id="refresh-icon" class="fa-solid fa-rotate"></i>
-                <span>Segarkan</span>
+              <button onclick="fetchMyAttendanceRecords(false)" class="text-[11px] font-bold text-blue-600 hover:underline">
+                <i class="fa-solid fa-rotate mr-1"></i>Refresh
               </button>
             </div>
-            <div id="records-list-container" class="space-y-2 max-h-48 overflow-y-auto pr-1" style="-webkit-overflow-scrolling: touch;"></div>
+            <div id="history-list-container" class="space-y-2 max-h-48 overflow-y-auto pr-1" style="-webkit-overflow-scrolling: touch;"></div>
           </div>
         </div>
       `;
-    }
 
-    window.manualRefreshRecords = async function() {
-      triggerHapticFeedback();
-      const ico = document.getElementById("refresh-icon");
-      if (ico) ico.classList.add("fa-spin");
-      await processOfflineQueue(true);
-      await fetchMyAttendanceRecords(false);
-      if (ico) ico.classList.remove("fa-spin");
-    };
-
-    function updateGpsCheckingBanner(show) {
-      const el = document.getElementById("gps-checking-banner");
-      if (!el) return;
-      if (show) el.classList.remove("hidden");
-      else el.classList.add("hidden");
-    }
-
-    function updateGpsBannersDom() {
-      const useGps = Boolean(appState.schoolConfig && appState.schoolConfig.useGpsLocation);
-      const gpsText = useGps
-        ? "GPS diaktifkan dan lakukan absensi di titik koordinat yang sudah ditentukan"
-        : "GPS tidak aktif, dapat melakukan absensi";
-
-      const loginBanner = document.getElementById("login-gps-banner");
-      if (loginBanner) {
-        loginBanner.className = `p-2.5 rounded-xl text-[11px] font-bold border ${useGps ? "bg-emerald-50 text-emerald-800 border-emerald-200" : "bg-slate-50 text-slate-600 border-slate-200"}`;
-        loginBanner.innerHTML = `<i class="fa-solid ${useGps ? "fa-location-dot text-emerald-600" : "fa-circle-info text-slate-400"} mr-1"></i> ${gpsText}`;
-      }
-
-      const dashHeaderGps = document.getElementById("dash-header-gps");
-      if (dashHeaderGps) {
-        dashHeaderGps.className = `text-[10px] mt-1 leading-snug ${useGps ? "text-emerald-300 font-bold" : "text-blue-100/90"}`;
-        dashHeaderGps.innerHTML = `<i class="fa-solid ${useGps ? "fa-location-dot" : "fa-circle-info"} mr-1"></i> ${gpsText}`;
-      }
-
-      const dashCardGps = document.getElementById("dash-card-gps");
-      if (dashCardGps) {
-        dashCardGps.className = `p-2.5 rounded-xl text-center text-[11px] font-bold border ${useGps ? "bg-emerald-50 text-emerald-800 border-emerald-200" : "bg-slate-50 text-slate-600 border-slate-200"}`;
-        dashCardGps.innerHTML = `<i class="fa-solid ${useGps ? "fa-location-dot text-emerald-600" : "fa-circle-info text-slate-400"} mr-1"></i> ${gpsText}`;
-      }
-
-      const entryLimitEl = document.getElementById("dash-entry-limit");
-      if (entryLimitEl) {
-        entryLimitEl.textContent = `${appState.schoolConfig.entryTimeLimit || "07:15:00"} WITA`;
-      }
-    }
-
-    function updateQueueStatusBanner() {
-      const banner = document.getElementById("offline-queue-banner");
-      if (!banner) return;
-
-      const qCount = appState.offlineQueue.length;
-      if (qCount === 0) {
-        banner.classList.add("hidden");
-        banner.innerHTML = "";
-        return;
-      }
-
-      banner.classList.remove("hidden");
-      if (isSyncingQueue) {
-        banner.innerHTML = `
-          <div class="bg-blue-50 border border-blue-200 rounded-2xl p-3 flex items-center justify-between gap-2 text-blue-900 shadow-sm">
-            <div class="flex items-center gap-2.5 text-xs">
-              <i class="fa-solid fa-cloud-arrow-up fa-bounce text-blue-600 text-base"></i>
-              <div>
-                <p class="font-black">Data Berhasil Tersimpan</p>
-                <p class="text-[11px] text-blue-700">Sedang mengirim (${qCount}) data ke server...</p>
-              </div>
-            </div>
-          </div>
-        `;
-      } else {
-        banner.innerHTML = `
-          <div class="bg-amber-50 border border-amber-300 rounded-2xl p-3 flex items-center justify-between gap-2 text-amber-950 shadow-sm">
-            <div class="flex items-center gap-2.5 text-xs">
-              <i class="fa-solid fa-clock-rotate-left text-amber-600 text-base shrink-0"></i>
-              <div>
-                <p class="font-black">Data Berhasil Tersimpan di HP (${qCount})</p>
-                <p class="text-[11px] text-amber-800">Menunggu sinyal stabil untuk kirim otomatis ke server.</p>
-              </div>
-            </div>
-            <button onclick="window.processOfflineQueue(true)" class="btn-3d px-2.5 py-1.5 bg-amber-600 text-white rounded-xl text-[10px] font-bold shrink-0 shadow-[0_3px_0_#92400e]">
-              Kirim Sekarang
-            </button>
-          </div>
-        `;
-      }
-    }
-
-    function updateDashboardDom() {
-      if (!appState.currentUser) return;
-
+      const clockEl = document.getElementById("live-clock");
+      if (clockEl) clockEl.textContent = getNowTimeStr();
       updateGpsBannersDom();
       updateQueueStatusBanner();
+    }
 
+    // Fungsi pembaruan parsial yang aman dan tidak membuat layar berkedip
+    function updateDashboardDom() {
+      if (!appState.currentUser) return;
       const todayStr = getTodayDateStr();
       const todayRec = appState.myRecords.find(r => r.date === todayStr);
       const checkoutInfo = canCheckOutNow();
       lastExitAllowedState = checkoutInfo.allowed;
       const lock = getDailyLockState(todayRec);
 
-      // Update Banner Konfirmasi "Data Berhasil Tersimpan" untuk hari ini
+      updateGpsBannersDom();
+      updateQueueStatusBanner();
+
       const savedBanner = document.getElementById("saved-confirmation-banner");
+      const savedSub = document.getElementById("saved-confirmation-sub");
+      const savedPill = document.getElementById("saved-sync-pill");
       if (savedBanner) {
-        if (todayRec) {
+        if (lock.hasAnyRecordToday) {
           savedBanner.classList.remove("hidden");
-          const isQueued = todayRec.sync_status === "queued" || appState.offlineQueue.some(q => q.tanggal === todayStr);
-          savedBanner.innerHTML = `
-            <div class="p-3 rounded-2xl bg-emerald-50 border border-emerald-200 flex items-center justify-between gap-2">
-              <div class="flex items-center gap-2.5">
-                <div class="w-8 h-8 rounded-full bg-emerald-600 text-white flex items-center justify-center shrink-0 shadow-sm">
-                  <i class="fa-solid fa-check text-sm"></i>
-                </div>
-                <div>
-                  <p class="text-xs font-black text-emerald-900">Data Berhasil Tersimpan</p>
-                  <p class="text-[10px] font-semibold text-emerald-700">
-                    ${isQueued
-                      ? "Tersimpan aman di HP • Auto-kirim ke server saat sinyal normal"
-                      : "Tercatat & tersinkronisasi dengan server sekolah"}
-                  </p>
-                </div>
-              </div>
-              <span class="px-2 py-0.5 rounded-full text-[9px] font-extrabold uppercase ${isQueued ? "bg-amber-100 text-amber-800" : "bg-emerald-200 text-emerald-900"}">
-                ${isQueued ? "Antrean" : "Terkirim"}
-              </span>
-            </div>
-          `;
+          if (savedSub) {
+            if (lock.hasCheckedOut) {
+              savedSub.textContent = `Masuk ${todayRec.check_in} • Pulang ${todayRec.check_out} WITA`;
+            } else if (lock.hasCheckedIn) {
+              savedSub.textContent = `Absen Masuk pukul ${todayRec.check_in} WITA (${todayRec.status})`;
+            } else {
+              savedSub.textContent = `Keterangan: ${todayRec.status}`;
+            }
+          }
+          if (savedPill) {
+            if (todayRec.pendingSync) {
+              savedPill.className = "px-2 py-0.5 rounded-full text-[9px] font-extrabold uppercase bg-amber-200 text-amber-900";
+              savedPill.textContent = "Antrean HP";
+            } else {
+              savedPill.className = "px-2 py-0.5 rounded-full text-[9px] font-extrabold uppercase bg-emerald-200/80 text-emerald-900";
+              savedPill.textContent = "Terkirim";
+            }
+          }
         } else {
           savedBanner.classList.add("hidden");
         }
       }
 
-      // Update Kartu Angka Masuk / Pulang / Status
-      const statIn = document.getElementById("stat-check-in");
-      const statOut = document.getElementById("stat-check-out");
-      const statStatus = document.getElementById("stat-status");
-
-      if (statIn) statIn.textContent = (todayRec && todayRec.check_in !== "-") ? todayRec.check_in : "--:--";
-      if (statOut) statOut.textContent = (todayRec && todayRec.check_out !== "-") ? todayRec.check_out : "--:--";
-      if (statStatus) {
-        statStatus.textContent = todayRec ? todayRec.status : "Belum Absen";
-        statStatus.className = `text-[11px] font-extrabold uppercase ${todayRec ? "text-indigo-700" : "text-slate-400"}`;
+      const elMasuk = document.getElementById("stat-jam-masuk");
+      const elPulang = document.getElementById("stat-jam-pulang");
+      const elStatus = document.getElementById("stat-status-hari");
+      if (elMasuk) elMasuk.textContent = (todayRec && todayRec.check_in !== "-") ? todayRec.check_in : "--:--";
+      if (elPulang) elPulang.textContent = (todayRec && todayRec.check_out !== "-") ? todayRec.check_out : "--:--";
+      if (elStatus) {
+        elStatus.textContent = todayRec ? todayRec.status : "Belum Absen";
+        elStatus.className = `text-[11px] font-extrabold uppercase ${todayRec ? "text-indigo-700" : "text-slate-400"}`;
       }
 
-      // Update Tombol 3D ABSEN MASUK
       const btnIn = document.getElementById("btn-absen-masuk");
+      const icoIn = document.getElementById("ico-absen-masuk");
+      const lblIn = document.getElementById("lbl-absen-masuk");
+      const subIn = document.getElementById("sub-absen-masuk");
       if (btnIn) {
         btnIn.disabled = lock.lockIn;
         if (lock.hasCheckedIn) {
-          btnIn.className = "btn-3d btn-flat-locked py-4 px-3 bg-emerald-100 text-emerald-800 border border-emerald-200 cursor-default font-black rounded-2xl flex flex-col items-center justify-center text-xs";
-          btnIn.innerHTML = `
-            <i class="fa-solid fa-circle-check text-xl mb-1 text-emerald-600"></i>
-            <span>DATA BERHASIL TERSIMPAN</span>
-            <span class="text-[9px] font-bold mt-0.5 text-emerald-700">Masuk ${escapeHTML(todayRec.check_in)}</span>
-          `;
+          btnIn.className = "btn-flat-locked py-4 px-3 bg-emerald-100 text-emerald-800 border border-emerald-200 cursor-default font-black rounded-2xl flex flex-col items-center justify-center text-xs";
+          if (icoIn) icoIn.className = "fa-solid fa-circle-check text-xl mb-1 text-emerald-600";
+          if (lblIn) lblIn.textContent = "SUDAH MASUK";
+          if (subIn) subIn.textContent = `Pukul ${todayRec.check_in}`;
         } else if (lock.isLeaveStatus) {
-          btnIn.className = "btn-3d btn-flat-locked py-4 px-3 bg-slate-200 text-slate-400 cursor-not-allowed font-black rounded-2xl flex flex-col items-center justify-center text-xs";
-          btnIn.innerHTML = `
-            <i class="fa-solid fa-lock text-xl mb-1"></i>
-            <span>TERKUNCI</span>
-            <span class="text-[9px] font-semibold mt-0.5">${escapeHTML(todayRec.status)}</span>
-          `;
+          btnIn.className = "btn-flat-locked py-4 px-3 bg-slate-200 text-slate-400 cursor-not-allowed font-black rounded-2xl flex flex-col items-center justify-center text-xs";
+          if (icoIn) icoIn.className = "fa-solid fa-lock text-xl mb-1";
+          if (lblIn) lblIn.textContent = "TERKUNCI";
+          if (subIn) subIn.textContent = todayRec.status;
         } else {
-          btnIn.className = "btn-3d btn-3d-emerald py-4 px-3 font-black rounded-2xl flex flex-col items-center justify-center text-xs cursor-pointer";
-          btnIn.innerHTML = `
-            <i class="fa-solid fa-right-to-bracket text-xl mb-1"></i>
-            <span>ABSEN MASUK</span>
-            <span class="text-[9px] font-semibold mt-0.5 opacity-90">Tekan 1x Sehari</span>
-          `;
+          btnIn.className = "btn-3d btn-3d-emerald py-4 px-3 font-black rounded-2xl flex flex-col items-center justify-center text-xs";
+          if (icoIn) icoIn.className = "fa-solid fa-right-to-bracket text-xl mb-1";
+          if (lblIn) lblIn.textContent = "ABSEN MASUK";
+          if (subIn) subIn.textContent = "1x Sehari";
         }
       }
 
-      // Update Tombol 3D ABSEN PULANG
       const btnOut = document.getElementById("btn-absen-pulang");
+      const icoOut = document.getElementById("ico-absen-pulang");
+      const lblOut = document.getElementById("lbl-absen-pulang");
+      const subOut = document.getElementById("sub-absen-pulang");
+      const canClickOut = !lock.lockOut && checkoutInfo.allowed;
       if (btnOut) {
-        const canClickOut = !lock.lockOut && checkoutInfo.allowed;
         btnOut.disabled = !canClickOut;
-
         if (lock.hasCheckedOut) {
-          btnOut.className = "btn-3d btn-flat-locked py-4 px-3 bg-blue-100 text-blue-800 border border-blue-200 cursor-default font-black rounded-2xl flex flex-col items-center justify-center text-xs";
-          btnOut.innerHTML = `
-            <i class="fa-solid fa-circle-check text-xl mb-1 text-blue-600"></i>
-            <span>DATA BERHASIL TERSIMPAN</span>
-            <span class="text-[9px] font-bold mt-0.5 text-blue-700">Pulang ${escapeHTML(todayRec.check_out)}</span>
-          `;
+          btnOut.className = "btn-flat-locked py-4 px-3 bg-blue-100 text-blue-800 border border-blue-200 cursor-default font-black rounded-2xl flex flex-col items-center justify-center text-xs";
+          if (icoOut) icoOut.className = "fa-solid fa-circle-check text-xl mb-1 text-blue-600";
+          if (lblOut) lblOut.textContent = "SUDAH PULANG";
+          if (subOut) subOut.textContent = `Pukul ${todayRec.check_out}`;
         } else if (lock.isLeaveStatus) {
-          btnOut.className = "btn-3d btn-flat-locked py-4 px-3 bg-slate-200 text-slate-400 cursor-not-allowed font-black rounded-2xl flex flex-col items-center justify-center text-xs";
-          btnOut.innerHTML = `
-            <i class="fa-solid fa-lock text-xl mb-1"></i>
-            <span>TERKUNCI</span>
-            <span class="text-[9px] font-semibold mt-0.5">${escapeHTML(todayRec.status)}</span>
-          `;
+          btnOut.className = "btn-flat-locked py-4 px-3 bg-slate-200 text-slate-400 cursor-not-allowed font-black rounded-2xl flex flex-col items-center justify-center text-xs";
+          if (icoOut) icoOut.className = "fa-solid fa-lock text-xl mb-1";
+          if (lblOut) lblOut.textContent = "TERKUNCI";
+          if (subOut) subOut.textContent = todayRec.status;
         } else if (!lock.hasCheckedIn) {
-          btnOut.className = "btn-3d btn-flat-locked py-4 px-3 bg-slate-200 text-slate-400 cursor-not-allowed font-black rounded-2xl flex flex-col items-center justify-center text-xs";
-          btnOut.innerHTML = `
-            <i class="fa-solid fa-lock text-xl mb-1"></i>
-            <span>ABSEN PULANG</span>
-            <span class="text-[9px] font-semibold mt-0.5">Absen Masuk Dulu</span>
-          `;
+          btnOut.className = "btn-flat-locked py-4 px-3 bg-slate-200 text-slate-400 cursor-not-allowed font-black rounded-2xl flex flex-col items-center justify-center text-xs";
+          if (icoOut) icoOut.className = "fa-solid fa-lock text-xl mb-1";
+          if (lblOut) lblOut.textContent = "ABSEN PULANG";
+          if (subOut) subOut.textContent = "Absen Masuk Dulu";
         } else if (checkoutInfo.allowed) {
-          btnOut.className = "btn-3d btn-3d-blue py-4 px-3 font-black rounded-2xl flex flex-col items-center justify-center text-xs cursor-pointer";
-          btnOut.innerHTML = `
-            <i class="fa-solid fa-right-from-bracket text-xl mb-1"></i>
-            <span>ABSEN PULANG</span>
-            <span class="text-[9px] font-semibold mt-0.5 opacity-90">Siap Pulang</span>
-          `;
+          btnOut.className = "btn-3d btn-3d-blue py-4 px-3 font-black rounded-2xl flex flex-col items-center justify-center text-xs";
+          if (icoOut) icoOut.className = "fa-solid fa-right-from-bracket text-xl mb-1";
+          if (lblOut) lblOut.textContent = "ABSEN PULANG";
+          if (subOut) subOut.textContent = "Siap Pulang";
         } else {
-          btnOut.className = "btn-3d btn-flat-locked py-4 px-3 bg-slate-200 text-slate-400 cursor-not-allowed font-black rounded-2xl flex flex-col items-center justify-center text-xs";
-          btnOut.innerHTML = `
-            <i class="fa-solid fa-clock text-xl mb-1"></i>
-            <span>ABSEN PULANG</span>
-            <span class="text-[9px] font-semibold mt-0.5">Buka ${escapeHTML(checkoutInfo.exitLimit)}</span>
-          `;
+          btnOut.className = "btn-flat-locked py-4 px-3 bg-slate-200 text-slate-400 cursor-not-allowed font-black rounded-2xl flex flex-col items-center justify-center text-xs";
+          if (icoOut) icoOut.className = "fa-solid fa-lock text-xl mb-1";
+          if (lblOut) lblOut.textContent = "ABSEN PULANG";
+          if (subOut) subOut.textContent = `Buka ${checkoutInfo.exitLimit}`;
         }
       }
 
-      // Update Tombol Keterangan Tidak Hadir
-      const leaveTitle = document.getElementById("leave-section-title");
-      if (leaveTitle) {
-        leaveTitle.textContent = lock.lockLeave
-          ? "Presensi Hari Ini Sudah Tercatat & Terkunci"
-          : "Keterangan Tidak Hadir Hari Ini (1x Pilih)";
-      }
-
+      const lblLeave = document.getElementById("lbl-leave-header");
       const btnDl = document.getElementById("btn-leave-dl");
       const btnIzin = document.getElementById("btn-leave-izin");
       const btnSakit = document.getElementById("btn-leave-sakit");
-
+      if (lblLeave) {
+        lblLeave.textContent = lock.lockLeave
+          ? "Presensi Hari Ini Sudah Tercatat & Terkunci"
+          : "Keterangan Tidak Hadir Hari Ini (1x Pilih)";
+      }
       if (btnDl) {
         btnDl.disabled = lock.lockLeave;
         btnDl.className = lock.lockLeave
-          ? "btn-3d btn-flat-locked py-2.5 bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed rounded-xl text-xs font-bold"
-          : "btn-3d btn-3d-cyan py-2.5 rounded-xl text-xs font-bold cursor-pointer";
+          ? "btn-flat-locked py-2.5 bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed rounded-xl text-xs font-bold"
+          : "btn-3d btn-3d-cyan py-2.5 rounded-xl text-xs font-bold";
       }
       if (btnIzin) {
         btnIzin.disabled = lock.lockLeave;
         btnIzin.className = lock.lockLeave
-          ? "btn-3d btn-flat-locked py-2.5 bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed rounded-xl text-xs font-bold"
-          : "btn-3d btn-3d-amber py-2.5 rounded-xl text-xs font-bold cursor-pointer";
+          ? "btn-flat-locked py-2.5 bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed rounded-xl text-xs font-bold"
+          : "btn-3d btn-3d-amber py-2.5 rounded-xl text-xs font-bold";
       }
       if (btnSakit) {
         btnSakit.disabled = lock.lockLeave;
         btnSakit.className = lock.lockLeave
-          ? "btn-3d btn-flat-locked py-2.5 bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed rounded-xl text-xs font-bold"
-          : "btn-3d btn-3d-purple py-2.5 rounded-xl text-xs font-bold cursor-pointer";
+          ? "btn-flat-locked py-2.5 bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed rounded-xl text-xs font-bold"
+          : "btn-3d btn-3d-purple py-2.5 rounded-xl text-xs font-bold";
       }
 
-      // Update Daftar Riwayat
-      const listEl = document.getElementById("records-list-container");
-      if (listEl) {
+      const histBox = document.getElementById("history-list-container");
+      if (histBox) {
         if (appState.myRecords.length === 0) {
-          listEl.innerHTML = `<p class="text-xs text-slate-400 text-center py-4">Belum ada catatan presensi.</p>`;
+          histBox.innerHTML = `<p class="text-xs text-slate-400 text-center py-4">Belum ada catatan presensi.</p>`;
         } else {
-          listEl.innerHTML = appState.myRecords.slice(0, 10).map(r => {
-            const isQueued = r.sync_status === "queued" || appState.offlineQueue.some(q => q.tanggal === r.date);
-            return `
-              <div class="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-slate-100 text-xs">
-                <div>
-                  <div class="font-bold text-slate-800 flex items-center gap-1.5">
-                    <span>${escapeHTML(formatDateIndo(r.date))}</span>
-                  </div>
-                  <div class="text-[10px] font-mono text-slate-500 mt-0.5">
-                    Masuk: ${escapeHTML(r.check_in || "-")} • Pulang: ${escapeHTML(r.check_out || "-")}
-                  </div>
-                  <div class="text-[9px] font-bold mt-0.5 ${isQueued ? "text-amber-600" : "text-emerald-600"}">
-                    <i class="fa-solid ${isQueued ? "fa-clock" : "fa-circle-check"} mr-0.5"></i>
-                    ${isQueued ? "Data Berhasil Tersimpan (Menunggu Sinyal)" : "Data Berhasil Tersimpan"}
-                  </div>
+          histBox.innerHTML = appState.myRecords.slice(0, 10).map(r => `
+            <div class="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-slate-100 text-xs">
+              <div>
+                <div class="font-bold text-slate-800 flex items-center gap-1.5">
+                  <span>${escapeHTML(formatDateIndo(r.date))}</span>
+                  ${r.pendingSync
+                    ? `<span class="px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded text-[9px] font-extrabold"><i class="fa-solid fa-clock mr-0.5"></i>Antrean</span>`
+                    : `<span class="text-emerald-600 text-[10px]" title="Tersimpan di Server"><i class="fa-solid fa-circle-check"></i></span>`
+                  }
                 </div>
-                <span class="px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase shrink-0 ${
-                  r.status === "Hadir" ? "bg-emerald-100 text-emerald-700" :
-                  r.status === "Terlambat" ? "bg-amber-100 text-amber-700" :
-                  "bg-purple-100 text-purple-700"
-                }">${escapeHTML(r.status)}</span>
+                <div class="text-[10px] font-mono text-slate-500">Masuk: ${escapeHTML(r.check_in || "-")} • Pulang: ${escapeHTML(r.check_out || "-")}</div>
               </div>
-            `;
-          }).join("");
+              <span class="px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase ${
+                r.status === "Hadir" ? "bg-emerald-100 text-emerald-700" :
+                r.status === "Terlambat" ? "bg-amber-100 text-amber-700" :
+                "bg-purple-100 text-purple-700"
+              }">${escapeHTML(r.status)}</span>
+            </div>
+          `).join("");
         }
       }
     }
@@ -1516,41 +1637,41 @@
       setupStandaloneAppMeta();
       loadSavedState();
       ensureViewRendered(true);
+      window.startContinuousGpsTracking();
 
-      // Jalankan sinkronisasi awal secara paralel agar cepat dan tidak berkedip
       const initTasks = [fetchSchoolsList()];
       if (appState.selectedSchool) {
         initTasks.push(fetchSchoolDataAndEmployees(appState.selectedSchool, true));
         if (appState.currentUser) {
-          initTasks.push(processOfflineQueue(false).then(() => fetchMyAttendanceRecords(true)));
+          initTasks.push(fetchMyAttendanceRecords(true));
         }
       }
-      await Promise.allSettled(initTasks);
+      await Promise.all(initTasks);
 
-      // Otomatis kirim antrean saat koneksi internet HP kembali aktif
+      if (appState.offlineQueue.length > 0) {
+        processOfflineQueue(true);
+      }
+
       window.addEventListener("online", () => {
-        processOfflineQueue(false);
+        if (appState.offlineQueue.length > 0) {
+          processOfflineQueue(true);
+        }
       });
 
-      // Timer 1 detik untuk jam berjalan & pengecekan otomatis antrean/jam pulang
       let tickCount = 0;
       setInterval(() => {
         const clockEl = document.getElementById("live-clock");
         if (clockEl) clockEl.textContent = getNowTimeStr();
 
         tickCount++;
-        if (appState.currentUser) {
-          // Cek apakah waktu pulang baru saja terbuka (update tombol tanpa render ulang layar)
-          if (tickCount % 10 === 0) {
-            const nowAllowed = canCheckOutNow().allowed;
-            if (lastExitAllowedState !== null && nowAllowed !== lastExitAllowedState) {
-              updateDashboardDom();
-            }
+        if (tickCount % 10 === 0 && appState.currentUser) {
+          const nowAllowed = canCheckOutNow().allowed;
+          if (lastExitAllowedState !== null && nowAllowed !== lastExitAllowedState) {
+            updateDashboardDom();
           }
-          // Coba kirim antrean offline setiap 15 detik jika masih ada data tertunda
-          if (tickCount % 15 === 0 && appState.offlineQueue.length > 0) {
-            processOfflineQueue(false);
-          }
+        }
+        if (tickCount % 15 === 0 && appState.offlineQueue.length > 0) {
+          processOfflineQueue(true);
         }
       }, 1000);
     });
